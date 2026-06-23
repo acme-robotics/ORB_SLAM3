@@ -545,6 +545,22 @@ void System::Shutdown()
         /*usleep(5000);
     }*/
 
+    // [N6] Wait for the mapping/loop-closing threads to actually stop before serializing
+    // the atlas. Upstream waits here, but this fork had the wait commented out -- so
+    // SaveAtlas()->mpAtlas->PreSave() raced the live threads and segfaulted mid-save,
+    // leaving no .osa on disk. Only needed when we're actually saving a map; bounded
+    // (~10 s) so a thread that never reports finished can't hang shutdown forever.
+    if(!mStrSaveAtlasToFile.empty())
+    {
+        for(int i = 0; i < 2000; ++i)
+        {
+            if(mpLocalMapper->isFinished() && mpLoopCloser->isFinished()
+               && !mpLoopCloser->isRunningGBA())
+                break;
+            usleep(5000);
+        }
+    }
+
     if(!mStrSaveAtlasToFile.empty())
     {
         Verbose::PrintMess("Atlas saving to file " + mStrSaveAtlasToFile, Verbose::VERBOSITY_NORMAL);
@@ -1399,6 +1415,28 @@ void System::InsertTrackTime(double& time)
     mpTracker->vdTrackTotal_ms.push_back(time);
 }
 #endif
+
+void System::SaveMapPLY(const string &filename)
+{
+    std::vector<Eigen::Vector3f> mpts, kfc;
+    for(Map* pMap : mpAtlas->GetAllMaps())
+    {
+        for(MapPoint* pMP : pMap->GetAllMapPoints())
+            if(pMP && !pMP->isBad()) mpts.push_back(pMP->GetWorldPos());
+        for(KeyFrame* pKF : pMap->GetAllKeyFrames())
+            if(pKF && !pKF->isBad()) kfc.push_back(pKF->GetCameraCenter());
+    }
+    std::ofstream f(filename.c_str());
+    f << "ply\nformat ascii 1.0\n";
+    f << "element vertex " << (mpts.size() + kfc.size()) << "\n";
+    f << "property float x\nproperty float y\nproperty float z\n";
+    f << "property uchar red\nproperty uchar green\nproperty uchar blue\nend_header\n";
+    for(const Eigen::Vector3f &p : mpts) f << p(0) << " " << p(1) << " " << p(2) << " 170 170 170\n";
+    for(const Eigen::Vector3f &c : kfc)  f << c(0) << " " << c(1) << " " << c(2) << " 255 60 60\n";
+    f.close();
+    cout << "[N6] SaveMapPLY: " << mpts.size() << " map points + " << kfc.size()
+         << " keyframes -> " << filename << endl;
+}
 
 void System::SaveAtlas(int type){
     if(!mStrSaveAtlasToFile.empty())

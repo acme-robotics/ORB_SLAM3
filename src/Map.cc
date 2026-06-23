@@ -359,7 +359,14 @@ void Map::SetLastMapChange(int currentChangeId)
 void Map::PreSave(std::set<GeometricCamera*> &spCams)
 {
     int nMPWithoutObs = 0;
-    for(MapPoint* pMPi : mspMapPoints)
+    // [N6] Iterate a SNAPSHOT, not mspMapPoints itself: EraseObservation() below can prune
+    // a point's observations to <=2, which fires SetBadFlag() -> Map::EraseMapPoint() ->
+    // mspMapPoints.erase(pMPi). Erasing from the set we're ranging over invalidates the
+    // iterator and crashes in _Rb_tree_increment when saving a fragmented map (poor
+    // tracking -> many low-obs points). The snapshot keeps iteration stable; the real set
+    // is free to shrink underneath us.
+    const std::set<MapPoint*> spMapPointsSnapshot(mspMapPoints);
+    for(MapPoint* pMPi : spMapPointsSnapshot)
     {
         if(!pMPi || pMPi->isBad())
             continue;

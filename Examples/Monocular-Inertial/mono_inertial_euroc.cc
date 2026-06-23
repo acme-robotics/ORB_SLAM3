@@ -118,6 +118,16 @@ int main(int argc, char *argv[])
 
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
     ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::IMU_MONOCULAR, true);
+
+    // [N6] Optional localization-only mode (freeze the loaded map and relocalize the
+    // sequence into it, UMI-style). Gated on env ORBSLAM_LOCALIZATION_ONLY so the
+    // EuRoC example's positional-arg signature stays unchanged.
+    if (const char* loc = getenv("ORBSLAM_LOCALIZATION_ONLY"))
+        if (std::string(loc) != "0" && std::string(loc).size()) {
+            cout << "[N6] Localization-only mode ON (map frozen)." << endl;
+            SLAM.ActivateLocalizationMode();
+        }
+
     float imageScale = SLAM.GetImageScale();
 
     double t_resize = 0.f;

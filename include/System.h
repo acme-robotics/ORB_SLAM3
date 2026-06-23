@@ -158,6 +158,10 @@ public:
     void SaveTrajectoryEuRoC(const string &filename, Map* pMap);
     void SaveKeyFrameTrajectoryEuRoC(const string &filename, Map* pMap);
 
+    // [N6] Dump the whole atlas as a coloured PLY point cloud: map points (grey) +
+    // keyframe camera centres (red). Used to visualize a loaded .osa map.
+    void SaveMapPLY(const string &filename);
+
     // Save data used for initialization debug
     void SaveDebugData(const int &iniIdx);
 
