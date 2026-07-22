@@ -429,6 +429,11 @@ namespace ORB_SLAM3 {
         else{
             insertKFsWhenLost_ = true;
         }
+
+        // [N6] IMU.fastInit was only parsed on the legacy yaml path
+        // (Tracking::ParseIMUParamFile); honor it from new-format files too.
+        int fastInit = readParameter<int>(fSettings,"IMU.fastInit",found,false);
+        fastIMUInit_ = found && fastInit != 0;
     }
 
     void Settings::readRGBD(cv::FileStorage& fSettings) {

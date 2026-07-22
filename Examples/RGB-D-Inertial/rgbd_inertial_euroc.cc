@@ -1,6 +1,14 @@
 /**
 * This file is part of ORB-SLAM3
 *
+* [N6] EuRoC-layout RGB-D-inertial runner for the tool-capture rig.
+* Same episode layout and CLI as mono_inertial_euroc, plus mav0/depth0/data:
+* sparse ToF depth rendered into the camera frame by host/tof_depthmap.py,
+* uint16 PNG in mm, named <ts_ns>.png like cam0. Depth exists only for camera
+* frames that time-paired to a ToF frame; frames without a depth file are fed
+* an all-zero depth image, so all their keypoints stay monocular (ORB-SLAM3
+* treats depth<=0 per keypoint as "no depth").
+*
 * Copyright (C) 2017-2021 Carlos Campos, Richard Elvira, Juan J. Gómez Rodríguez, José M.M. Montiel and Juan D. Tardós, University of Zaragoza.
 * Copyright (C) 2014-2016 Raúl Mur-Artal, José M.M. Montiel and Juan D. Tardós, University of Zaragoza.
 *
@@ -16,33 +24,34 @@
 * If not, see <http://www.gnu.org/licenses/>.
 */
 
-
 #include<iostream>
 #include<algorithm>
 #include<fstream>
 #include<chrono>
-#include <ctime>
-#include <sstream>
+#include<ctime>
+#include<sstream>
+#include<sys/stat.h>
 
 #include<opencv2/core/core.hpp>
 
 #include<System.h>
-#include "ImuTypes.h"
+#include"ImuTypes.h"
 
 using namespace std;
 
-void LoadImages(const string &strImagePath, const string &strPathTimes,
-                vector<string> &vstrImages, vector<double> &vTimeStamps);
+void LoadImages(const string &strImagePath, const string &strDepthPath,
+                const string &strPathTimes, vector<string> &vstrImages,
+                vector<string> &vstrDepth, vector<double> &vTimeStamps);
 
-void LoadIMU(const string &strImuPath, vector<double> &vTimeStamps, vector<cv::Point3f> &vAcc, vector<cv::Point3f> &vGyro);
+void LoadIMU(const string &strImuPath, vector<double> &vTimeStamps,
+             vector<cv::Point3f> &vAcc, vector<cv::Point3f> &vGyro);
 
 double ttrack_tot = 0;
 int main(int argc, char *argv[])
 {
-
     if(argc < 5)
     {
-        cerr << endl << "Usage: ./mono_inertial_euroc path_to_vocabulary path_to_settings path_to_sequence_folder_1 path_to_times_file_1 (path_to_image_folder_2 path_to_times_file_2 ... path_to_image_folder_N path_to_times_file_N) " << endl;
+        cerr << endl << "Usage: ./rgbd_inertial_euroc path_to_vocabulary path_to_settings path_to_sequence_folder_1 path_to_times_file_1 (path_to_image_folder_2 path_to_times_file_2 ... path_to_image_folder_N path_to_times_file_N) " << endl;
         return 1;
     }
 
@@ -59,6 +68,7 @@ int main(int argc, char *argv[])
     // Load all sequences:
     int seq;
     vector< vector<string> > vstrImageFilenames;
+    vector< vector<string> > vstrDepthFilenames;
     vector< vector<double> > vTimestampsCam;
     vector< vector<cv::Point3f> > vAcc, vGyro;
     vector< vector<double> > vTimestampsImu;
@@ -67,6 +77,7 @@ int main(int argc, char *argv[])
     vector<int> first_imu(num_seq,0);
 
     vstrImageFilenames.resize(num_seq);
+    vstrDepthFilenames.resize(num_seq);
     vTimestampsCam.resize(num_seq);
     vAcc.resize(num_seq);
     vGyro.resize(num_seq);
@@ -83,10 +94,19 @@ int main(int argc, char *argv[])
         string pathTimeStamps(argv[(2*seq) + 4]);
 
         string pathCam0 = pathSeq + "/mav0/cam0/data";
+        string pathDepth0 = pathSeq + "/mav0/depth0/data";
         string pathImu = pathSeq + "/mav0/imu0/data.csv";
 
-        LoadImages(pathCam0, pathTimeStamps, vstrImageFilenames[seq], vTimestampsCam[seq]);
+        LoadImages(pathCam0, pathDepth0, pathTimeStamps,
+                   vstrImageFilenames[seq], vstrDepthFilenames[seq], vTimestampsCam[seq]);
         cout << "LOADED!" << endl;
+
+        int nDepth = 0;
+        for(size_t i=0; i<vstrDepthFilenames[seq].size(); i++)
+            if(!vstrDepthFilenames[seq][i].empty())
+                nDepth++;
+        cout << "Depth images present for " << nDepth << "/"
+             << vstrDepthFilenames[seq].size() << " frames (others run monocular)." << endl;
 
         cout << "Loading IMU for sequence " << seq << "...";
         LoadIMU(pathImu, vTimestampsImu[seq], vAcc[seq], vGyro[seq]);
@@ -119,7 +139,7 @@ int main(int argc, char *argv[])
     // Create SLAM system. It initializes all system threads and gets ready to process frames.
     // [N6] Honor SLAM_NO_VIEWER so headless runs don't crash the Pangolin viewer under xvfb.
     bool bUseViewer = (getenv("SLAM_NO_VIEWER") == nullptr);
-    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::IMU_MONOCULAR, bUseViewer);
+    ORB_SLAM3::System SLAM(argv[1],argv[2],ORB_SLAM3::System::IMU_RGBD, bUseViewer);
 
     // [N6] Optional localization-only mode (freeze the loaded map and relocalize the
     // sequence into it, UMI-style). Gated on env ORBSLAM_LOCALIZATION_ONLY so the
@@ -132,21 +152,18 @@ int main(int argc, char *argv[])
 
     float imageScale = SLAM.GetImageScale();
 
-    double t_resize = 0.f;
-    double t_track = 0.f;
-
     int proccIm=0;
     for (seq = 0; seq<num_seq; seq++)
     {
-
         // Main loop
-        cv::Mat im;
+        cv::Mat im, depth;
+        cv::Mat depthZero;                 // reused all-zero depth for unpaired frames
         vector<ORB_SLAM3::IMU::Point> vImuMeas;
         proccIm = 0;
         for(int ni=0; ni<nImages[seq]; ni++, proccIm++)
         {
             // Read image from file
-            im = cv::imread(vstrImageFilenames[seq][ni],cv::IMREAD_UNCHANGED); //CV_LOAD_IMAGE_UNCHANGED);
+            im = cv::imread(vstrImageFilenames[seq][ni],cv::IMREAD_UNCHANGED);
 
             double tframe = vTimestampsCam[seq][ni];
 
@@ -157,27 +174,33 @@ int main(int argc, char *argv[])
                 return 1;
             }
 
+            if(!vstrDepthFilenames[seq][ni].empty())
+            {
+                depth = cv::imread(vstrDepthFilenames[seq][ni], cv::IMREAD_UNCHANGED);
+                if(depth.empty() || depth.type() != CV_16UC1)
+                {
+                    cerr << endl << "Bad depth image (want 16UC1) at: "
+                         << vstrDepthFilenames[seq][ni] << endl;
+                    return 1;
+                }
+            }
+            else
+            {
+                if(depthZero.empty())
+                    depthZero = cv::Mat::zeros(im.rows, im.cols, CV_16UC1);
+                depth = depthZero;
+            }
+
             if(imageScale != 1.f)
             {
-#ifdef REGISTER_TIMES
-    #ifdef COMPILEDWITHC11
-                std::chrono::steady_clock::time_point t_Start_Resize = std::chrono::steady_clock::now();
-    #else
-                std::chrono::monotonic_clock::time_point t_Start_Resize = std::chrono::monotonic_clock::now();
-    #endif
-#endif
                 int width = im.cols * imageScale;
                 int height = im.rows * imageScale;
                 cv::resize(im, im, cv::Size(width, height));
-#ifdef REGISTER_TIMES
-    #ifdef COMPILEDWITHC11
-                std::chrono::steady_clock::time_point t_End_Resize = std::chrono::steady_clock::now();
-    #else
-                std::chrono::monotonic_clock::time_point t_End_Resize = std::chrono::monotonic_clock::now();
-    #endif
-                t_resize = std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(t_End_Resize - t_Start_Resize).count();
-                SLAM.InsertResizeTime(t_resize);
-#endif
+                // Nearest neighbor: interpolating metric depth across the sparse
+                // zone quads would manufacture edge depths the sensor never saw.
+                cv::Mat dscaled;
+                cv::resize(depth, dscaled, cv::Size(width, height), 0, 0, cv::INTER_NEAREST);
+                depth = dscaled;
             }
 
             // Load imu measurements from previous frame
@@ -185,8 +208,6 @@ int main(int argc, char *argv[])
 
             if(ni>0)
             {
-                // cout << "t_cam " << tframe << endl;
-
                 while(vTimestampsImu[seq][first_imu[seq]]<=vTimestampsCam[seq][ni])
                 {
                     vImuMeas.push_back(ORB_SLAM3::IMU::Point(vAcc[seq][first_imu[seq]].x,vAcc[seq][first_imu[seq]].y,vAcc[seq][first_imu[seq]].z,
@@ -203,8 +224,7 @@ int main(int argc, char *argv[])
     #endif
 
             // Pass the image to the SLAM system
-            // cout << "tframe = " << tframe << endl;
-            SLAM.TrackMonocular(im,tframe,vImuMeas); // TODO change to monocular_inertial
+            SLAM.TrackRGBD(im,depth,tframe,vImuMeas);
 
     #ifdef COMPILEDWITHC11
             std::chrono::steady_clock::time_point t2 = std::chrono::steady_clock::now();
@@ -212,14 +232,8 @@ int main(int argc, char *argv[])
             std::chrono::monotonic_clock::time_point t2 = std::chrono::monotonic_clock::now();
     #endif
 
-#ifdef REGISTER_TIMES
-            t_track = t_resize + std::chrono::duration_cast<std::chrono::duration<double,std::milli> >(t2 - t1).count();
-            SLAM.InsertTrackTime(t_track);
-#endif
-
             double ttrack= std::chrono::duration_cast<std::chrono::duration<double> >(t2 - t1).count();
             ttrack_tot += ttrack;
-            // std::cout << "ttrack: " << ttrack << std::endl;
 
             vTimesTrack[ni]=ttrack;
 
@@ -261,13 +275,16 @@ int main(int argc, char *argv[])
     return 0;
 }
 
-void LoadImages(const string &strImagePath, const string &strPathTimes,
-                vector<string> &vstrImages, vector<double> &vTimeStamps)
+void LoadImages(const string &strImagePath, const string &strDepthPath,
+                const string &strPathTimes, vector<string> &vstrImages,
+                vector<string> &vstrDepth, vector<double> &vTimeStamps)
 {
     ifstream fTimes;
     fTimes.open(strPathTimes.c_str());
     vTimeStamps.reserve(5000);
     vstrImages.reserve(5000);
+    vstrDepth.reserve(5000);
+    struct stat st;
     while(!fTimes.eof())
     {
         string s;
@@ -277,15 +294,17 @@ void LoadImages(const string &strImagePath, const string &strPathTimes,
             stringstream ss;
             ss << s;
             vstrImages.push_back(strImagePath + "/" + ss.str() + ".png");
+            string depthFile = strDepthPath + "/" + ss.str() + ".png";
+            vstrDepth.push_back(stat(depthFile.c_str(), &st) == 0 ? depthFile : string());
             double t;
             ss >> t;
             vTimeStamps.push_back(t/1e9);
-
         }
     }
 }
 
-void LoadIMU(const string &strImuPath, vector<double> &vTimeStamps, vector<cv::Point3f> &vAcc, vector<cv::Point3f> &vGyro)
+void LoadIMU(const string &strImuPath, vector<double> &vTimeStamps,
+             vector<cv::Point3f> &vAcc, vector<cv::Point3f> &vGyro)
 {
     ifstream fImu;
     fImu.open(strImuPath.c_str());

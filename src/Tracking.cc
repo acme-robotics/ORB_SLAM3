@@ -603,6 +603,9 @@ void Tracking::newParameterLoader(Settings *settings) {
     //IMU parameters
     Sophus::SE3f Tbc = settings->Tbc();
     mInsertKFsLost = settings->insertKFsWhenLost();
+    mFastInit = settings->fastIMUInit();
+    if(mFastInit)
+        cout << "Fast IMU initialization. Acceleration is not checked \n";
     mImuFreq = settings->imuFrequency();
     mImuPer = 0.001; //1.0 / (double) mImuFreq;     //TODO: ESTO ESTA BIEN?
     float Ng = settings->noiseGyro();
@@ -2146,7 +2149,12 @@ void Tracking::Track()
             if (mSensor == System::IMU_MONOCULAR || mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
             {
                 Verbose::PrintMess("Track lost for less than one second...", Verbose::VERBOSITY_NORMAL);
-                if(!pCurrentMap->isImuInitialized() || !pCurrentMap->GetIniertialBA2())
+                // [N6] IMU_RGBD: the map is depth-anchored (metric from frame one),
+                // so a pre-VIBA2 tracking blip does not invalidate it. Keep the map
+                // and let RECENTLY_LOST relocalization handle the blip; only the
+                // scale-unobservable sensors need the protective reset.
+                if((!pCurrentMap->isImuInitialized() || !pCurrentMap->GetIniertialBA2())
+                        && mSensor != System::IMU_RGBD)
                 {
                     cout << "IMU is not or recently initialized. Reseting active map..." << endl;
                     mpSystem->ResetActiveMap();
@@ -2336,6 +2344,18 @@ void Tracking::StereoInitialization()
 {
     if(mCurrentFrame.N>500)
     {
+        // [N6] Sparse-depth RGBD (ToF): frames without a paired depth image
+        // have zero depth keypoints; initializing on one creates an EMPTY map
+        // and an instant reset. Wait for a frame the depth stream covers.
+        if(mSensor == System::RGBD || mSensor == System::IMU_RGBD)
+        {
+            int nDepth = 0;
+            for(int i=0; i<mCurrentFrame.N; i++)
+                if(mCurrentFrame.mvDepth[i]>0)
+                    nDepth++;
+            if(nDepth<50)
+                return;
+        }
         if (mSensor == System::IMU_STEREO || mSensor == System::IMU_RGBD)
         {
             if (!mCurrentFrame.mpImuPreintegrated || !mLastFrame.mpImuPreintegrated)
@@ -2859,7 +2879,12 @@ bool Tracking::TrackWithMotionModel()
     // Create "visual odometry" points if in Localization Mode
     UpdateLastFrame();
 
-    if (mpAtlas->isImuInitialized() && (mCurrentFrame.mnId>mnLastRelocFrameId+mnFramesToResetIMU))
+    // Only use IMU prediction if THIS session is inertial. When a pure-monocular session
+    // localizes into a loaded inertial map (map->localize), the merged map reports
+    // isImuInitialized()==true but the mono frames have no IMU chain -> PredictStateIMU /
+    // the inertial optimizer would deref a null KeyFrame. A mono sensor must stay visual.
+    const bool bInertialSession = (mSensor==System::IMU_MONOCULAR || mSensor==System::IMU_STEREO || mSensor==System::IMU_RGBD);
+    if (bInertialSession && mpAtlas->isImuInitialized() && (mCurrentFrame.mnId>mnLastRelocFrameId+mnFramesToResetIMU))
     {
         // Predict state with IMU if it is initialized and it doesnt need reset
         PredictStateIMU();
@@ -2967,7 +2992,11 @@ bool Tracking::TrackLocalMap()
         }
 
     int inliers;
-    if (!mpAtlas->isImuInitialized())
+    // A pure-monocular session (e.g. map->localize into a loaded inertial map) must use the
+    // visual optimizer even though the merged map reports isImuInitialized()==true -- its frames
+    // have no IMU preintegration, so the inertial optimizer would null-deref. See bInertialSession.
+    const bool bInertialSession = (mSensor==System::IMU_MONOCULAR || mSensor==System::IMU_STEREO || mSensor==System::IMU_RGBD);
+    if (!mpAtlas->isImuInitialized() || !bInertialSession)
         Optimizer::PoseOptimization(&mCurrentFrame);
     else
     {

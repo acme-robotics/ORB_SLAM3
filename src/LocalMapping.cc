@@ -99,6 +99,11 @@ void LocalMapping::Run()
 
             // Triangulate new MapPoints
             CreateNewMapPoints();
+            // [INSTR] map growth (matches SP_SLAM3 instrumentation for comparison).
+            std::cout << "[INSTR-MAP] KFs=" << mpAtlas->KeyFramesInMap()
+                      << " mapPoints=" << mpAtlas->GetCurrentMap()->MapPointsInMap()
+                      << " recentAdded=" << mlpRecentAddedMapPoints.size()
+                      << " imuInit=" << mpAtlas->GetCurrentMap()->isImuInitialized() << std::endl;
 
             mbAbortBA = false;
 
@@ -131,11 +136,16 @@ void LocalMapping::Run()
                         float dist = (mpCurrentKeyFrame->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->GetCameraCenter()).norm() +
                                 (mpCurrentKeyFrame->mPrevKF->mPrevKF->GetCameraCenter() - mpCurrentKeyFrame->mPrevKF->GetCameraCenter()).norm();
 
-                        if(dist>0.05)
+                        // [N6] IMU_RGBD: scale is depth-anchored, so low motion does
+                        // not make the inertial init degenerate. Accumulate mTinit on
+                        // wall-clock (so VIBA1/2 run on schedule) and never reset the
+                        // map for lack of excitation. Mono/stereo keep stock behavior.
+                        bool bDepthAnchored = mpTracker->mSensor==System::IMU_RGBD;
+                        if(dist>0.05 || bDepthAnchored)
                             mTinit += mpCurrentKeyFrame->mTimeStamp - mpCurrentKeyFrame->mPrevKF->mTimeStamp;
                         if(!mpCurrentKeyFrame->GetMap()->GetIniertialBA2())
                         {
-                            if((mTinit<10.f) && (dist<0.02))
+                            if((mTinit<10.f) && (dist<0.02) && !bDepthAnchored)
                             {
                                 cout << "Not enough motion for initializing. Reseting..." << endl;
                                 unique_lock<mutex> lock(mMutexReset);
@@ -1190,7 +1200,11 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
 
 
     if(mpAtlas->KeyFramesInMap()<nMinKF)
+    {
+        std::cout << "[INSTR-IMUINIT] BAIL gate=KFsInMap KFsInMap=" << mpAtlas->KeyFramesInMap()
+                  << " nMinKF=" << nMinKF << std::endl;
         return;
+    }
 
     // Retrieve all keyframe in temporal order
     list<KeyFrame*> lpKF;
@@ -1204,11 +1218,22 @@ void LocalMapping::InitializeIMU(float priorG, float priorA, bool bFIBA)
     vector<KeyFrame*> vpKF(lpKF.begin(),lpKF.end());
 
     if(vpKF.size()<nMinKF)
+    {
+        std::cout << "[INSTR-IMUINIT] BAIL gate=chainLen chainLen=" << vpKF.size()
+                  << " nMinKF=" << nMinKF << " (KFsInMap=" << mpAtlas->KeyFramesInMap() << ")" << std::endl;
         return;
+    }
 
     mFirstTs=vpKF.front()->mTimeStamp;
     if(mpCurrentKeyFrame->mTimeStamp-mFirstTs<minTime)
+    {
+        std::cout << "[INSTR-IMUINIT] BAIL gate=timeSpan span="
+                  << (mpCurrentKeyFrame->mTimeStamp-mFirstTs) << "s minTime=" << minTime
+                  << " chainLen=" << vpKF.size() << std::endl;
         return;
+    }
+    std::cout << "[INSTR-IMUINIT] PASSED gates: chainLen=" << vpKF.size()
+              << " span=" << (mpCurrentKeyFrame->mTimeStamp-mFirstTs) << "s" << std::endl;
 
     bInitializing = true;
 
